@@ -1,0 +1,1525 @@
+/*
+ * Copyright (c) ${YEAR} ${PACKAGE_NAME}
+ */
+
+package com.company.thesisab.core.app;
+
+import com.company.thesisab.beans.CardHelper;
+import com.company.thesisab.beans.DateHelper;
+import com.company.thesisab.beans.HttpSender;
+import com.company.thesisab.config.HttpRequestsConfig;
+import com.company.thesisab.core.config.IntrumAPIConfig;
+import com.company.thesisab.entity.EmployeeStatus;
+import com.company.thesisab.entity.ExtDepartment;
+import com.company.thesisab.entity.ExtEmployee;
+import com.company.thesisab.beans.EmployeeLoaderMBean;
+import com.haulmont.chile.core.common.ValueListener;
+import com.haulmont.cuba.core.global.*;
+import com.haulmont.cuba.core.sys.AppContext;
+import com.haulmont.cuba.core.sys.SecurityContext;
+import com.haulmont.cuba.security.app.Authenticated;
+import com.haulmont.cuba.security.app.Authentication;
+import com.haulmont.cuba.security.app.LoginWorker;
+import com.haulmont.cuba.security.entity.User;
+import com.haulmont.cuba.security.global.LoginException;
+import com.haulmont.cuba.security.global.UserSession;
+import com.haulmont.cuba.security.global.UserUtils;
+import com.haulmont.thesis.core.entity.Department;
+import com.haulmont.thesis.core.entity.EmployeeDepartmentPositionRelation;
+import com.haulmont.thesis.core.entity.Organization;
+import com.haulmont.thesis.core.entity.Position;
+import com.haulmont.thesis.core.enums.SexEnum;
+import com.haulmont.workflow.core.entity.CardProc;
+import com.haulmont.workflow.core.entity.CardRole;
+import com.jayway.jsonpath.spi.json.JsonSmartJsonProvider;
+import net.minidev.json.JSONArray;
+import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.lang.StringUtils;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.impl.client.DefaultHttpClient;
+import org.springframework.stereotype.Component;
+
+import java.io.InputStream;
+import java.net.URI;
+import java.text.ParseException;
+import java.text.ParsePosition;
+import java.text.SimpleDateFormat;
+import java.util.*;
+
+
+@Component(EmployeeLoader.NAME)
+public class EmployeeLoader implements EmployeeLoaderMBean {
+
+    public final static String NAME = "thesisab_EmployeeLoaderMBean";
+    
+    public static final String DEFAULT_NAME_PATTERN = "{FF| }{LL}";
+    
+    //Всякие захардкоденные названия
+    public static final String CREDIT_WORKER = "специалист отдела кредитования, " +
+        "страхования и оформления";
+    public static final String CREDIT_WORKER_TOKEN = "кредит";
+    public static final String MANAGER = "менеджер по продажам";
+    public static final String MANAGER_TOKEN = "менеджер";
+    public static final String DEALERSHIP_CHIEF = "руководитель автосалона";
+    public static final String DEALERSHIP_CHIEF_TOKEN = "руководитель площадки";
+    public static final String TECH_WORKER = "специалист по предпродажной подготовке";
+    public static final String TECH_WORKER_TOKEN = "предпродажн";
+    public static final String MANAGER_GROUP_CHIEF = "руководитель группы продаж";
+    public static final String MANAGER_GROUP = "группа менеджеров";
+    
+    @Deprecated
+    public void loadEmployees() {
+
+        Authentication authentication = AppBeans.get(Authentication.class);
+        Object json;
+        Map jsonMap = null;
+        JsonSmartJsonProvider jsonSmartJsonProvider = new JsonSmartJsonProvider();
+
+        try {
+            Configuration conf = AppBeans.get(Configuration.class);
+            HttpRequestsConfig config = conf.getConfig(HttpRequestsConfig.class);
+            DataManager dataManager = AppBeans.get(DataManager.class);
+            Metadata metadata = AppBeans.get(Metadata.class);
+            LoginWorker loginWorker = AppBeans.get(LoginWorker.class);
+            DateHelper dateHelper = AppBeans.get(DateHelper.class);
+            UserSession anonymousSession;
+            try {
+                anonymousSession = loginWorker.loginSystem("system");
+            } catch (LoginException e) {
+                throw new RuntimeException("Unable to obtain anonymous session");
+            }
+            AppContext.setSecurityContext(new SecurityContext(anonymousSession));
+            JSONArray jsonArray = null;
+
+            String pattern = AppContext.getProperty("cuba.user.fullNamePattern");
+            if (StringUtils.isBlank(pattern)) {
+                pattern = DEFAULT_NAME_PATTERN;
+
+            }
+
+            String connectTimeout = config.getHttpRequestsConnectTimeout(); // in milliseconds
+            String readTimeout = config.getHttpRequestsReadTimeout(); // in milliseconds
+            String url = config.getHttpRequestsEmpScriptUrl();
+            URI uri = new URI(url);
+
+            HttpGet httpGet = new HttpGet();
+            httpGet.setURI(uri);
+
+            HttpClient httpClient = new DefaultHttpClient();
+            System.setProperty("sun.net.client.defaultConnectTimeout", connectTimeout);
+            System.setProperty("sun.net.client.defaultReadTimeout", readTimeout);
+
+            HttpResponse response = httpClient.execute(httpGet);
+
+            //Загружаем список должностей из "Тезис"
+            LoadContext posCtx = new LoadContext(Position.class);
+            posCtx.setView("_local").setQueryString("select p from df$Position p " +
+                                                    "where lower(p.name) like '%менеджер%' or " +
+                                                    "lower(p.name) like '%кредитовани%' or " +
+                                                    "lower(p.name) like '%продаж%' or " +
+                                                    "lower(p.name) like '%автосалона%' or " +
+                                                    "lower(p.name) = 'техник' or " +
+                                                    "lower(p.name) = 'начальник отдела' or " +
+                                                    "lower(p.name) like '%безопасност%'");
+
+            List posList = dataManager.loadList(posCtx);
+            Position    manager = null,             //"Менеджер по продажам"
+                        majorMngr = null,           //"Старший менеджер"
+                        headMngr = null,            //"Руководитель группы продаж"
+                        expMngr = null,             //"Менеджер-эксперт"
+                        majorExpMngr = null,        //"Старший менеджер-эксперт"
+                        dealershipHead = null,      //"Руководитель автосалона"
+                        creditWorker = null,        //"Специалист отдела кредитования..."
+                        majorCreditWorker = null,   //"Старший специалист отдела кредитования"
+                        departmentChief = null,     //"Начальник отдела"
+                        tech = null,                //"Техник"
+                        prepairSpec = null,         //"Специалист по предпродажной подготовке"
+                        majorPrepairSpec = null,    //"Старший специалист по предпродажной
+                                                    // подготовке"
+                        prepairSpecHead = null,     //"Начальник отдела предпродажной подготовки"
+                        majorSafetySpec = null,     //"Старший специалист службы экономической
+                                                    // безопасности"
+                        safetySpec = null;          //"Инспектор службы экономической безопасности"
+
+
+            for (Object o : posList) {
+                if (o instanceof Position) {
+                    Position p = (Position)o;
+                    switch (p.getName().toLowerCase()) {
+                        case "менеджер по продажам":
+                            manager = p;
+                            break;
+                        case "старший менеджер":
+                            majorMngr = p;
+                            break;
+                        case "менеджер-эксперт":
+                            expMngr = p;
+                            break;
+                        case "старший менеджер-эксперт":
+                            majorExpMngr = p;
+                            break;
+                        case "руководитель группы продаж":
+                            headMngr = p;
+                            break;
+                        case "руководитель автосалона":
+                            dealershipHead = p;
+                            break;
+                        case "специалист отдела кредитования":
+                            creditWorker = p;
+                            break;
+                        case "старший специалист отдела кредитования":
+                            majorCreditWorker = p;
+                            break;
+                        case "начальник отдела":
+                            departmentChief = p;
+                            break;
+                        case "техник":
+                            tech = p;
+                            break;
+                        case "специалист по предпродажной подготовке":
+                            prepairSpec = p;
+                            break;
+                        case "старший специалист по предпродажной подготовке":
+                            majorPrepairSpec = p;
+                            break;
+                        case "начальник отдела предпродажной подготовки":
+                            prepairSpecHead = p;
+                            break;
+                        case "инспектор службы экономической безопасности":
+                            safetySpec = p;
+                            break;
+                        case "старший специалист службы экономической безопасности":
+                            majorSafetySpec = p;
+                            break;
+                    }
+                }
+            }
+
+            //Загружаем всех сотрудников нужных подразделений из "Тезиса"
+            List eList;
+            LoadContext ctx = new LoadContext(ExtEmployee.class);
+            //Здесь собирается коллекция сотрудников по полю подразделения
+            //Нужно сделать через employeeDepartmentPositionRelations
+            ctx.setView("edit").setQueryString("select e from thesisab$Employee e " +
+                    "left join e.employeeDepartmentPositionRelations edpr " +
+                    "where (edpr.department.code like '1%' " +
+                    "or edpr.department.code = '002' or edpr.department.code like '006%') and " +
+                    "(e.comment is null or e.comment not like '%увол%') and e.status <> 'fired'");
+            eList = dataManager.loadList(ctx);
+
+            if (response != null) {
+
+                InputStream is = response.getEntity().getContent();
+                json = jsonSmartJsonProvider.parse(is, "UTF-8");
+
+                if (json instanceof JSONArray) {
+                    jsonArray = (JSONArray) json;
+
+
+                    //Проход по имеющемуся списку сотрудников и сравнение их с каждым новым JSON.
+                    // При отсутствии совпадений с присланным списком он помечается как уволенный.
+                    for (Object e : eList) {
+                        ExtEmployee empl = (ExtEmployee)e;
+                        String emplLastName = empl.getLastName().toLowerCase();
+                        String emplFirstName = empl.getFirstName().toLowerCase();
+                        Date emplBirthDate = empl.getBirthDate();
+                        boolean isPresent = false;
+                        for (Object o : jsonArray) {
+                            if (o instanceof LinkedHashMap) {
+                                jsonMap = (LinkedHashMap)o;
+                                String lastName = ((String)jsonMap.get("last_name")).toLowerCase();
+                                String firstName = ((String)jsonMap.get("name")).toLowerCase();
+                                Object b = jsonMap.get("birthday");
+                                Long birthDateTime = b instanceof Integer ? (int)b * 1000L : null;
+                                Date birthday;
+                                if (birthDateTime != null) {
+                                    birthday = dateHelper.createDateWithoutTimeFromDate(birthDateTime);
+                                } else {
+                                    birthday = null;
+                                }
+
+                                if (emplLastName != null && emplFirstName != null &&
+                                        (emplLastName.equals(lastName) &&
+                                        emplFirstName.equals(firstName) ||
+                                        emplLastName.equals(firstName) &&
+                                        emplFirstName.equals(lastName)) && (birthday == null || emplBirthDate == null ||
+                                        emplBirthDate.equals(birthday))) {
+                                    isPresent = true;
+                                }
+                            }
+                        }
+                        if (!isPresent) {
+                            //Если сотрдник не найден в списке отправленных из Bitrix, то
+                            // проставляется "уволен"
+
+                            empl.setStatus(EmployeeStatus.fired);
+                            dataManager.commit(empl);
+                        }
+                    }
+
+                    for (Object o : jsonArray) {
+                        if (o instanceof LinkedHashMap) {
+                            jsonMap = (LinkedHashMap) o;
+                            String firstName = (String) jsonMap.get("name");
+                            String lastName = (String) jsonMap.get("last_name");
+                            Object b = jsonMap.get("birthday");
+                            Long birthDateTime = b instanceof Integer ? (int)b * 1000L : null;
+                            Date birthday;
+                            if (birthDateTime != null) {
+                                birthday = dateHelper.createDateWithoutTimeFromDate(birthDateTime);
+                            } else {
+                                birthday = null;
+                            }
+
+                            //Исключаем json'ы незаполненных сотрудников
+                            if (firstName == null || lastName == null || firstName.length() == 0
+                                    || lastName.length() == 0) {
+                                continue;
+                            }
+
+                            //Определяем, какие из загруженных из "Тезиса" сотрудников совпали с json
+                            List<Object> corEmps = new ArrayList<>();
+
+                            for (Object e : eList) {
+                                if (e instanceof ExtEmployee) {
+                                    ExtEmployee empl = (ExtEmployee) e;
+                                    String emplFirstName = empl.getFirstName().toLowerCase();
+                                    String emplLastName = empl.getLastName().toLowerCase();
+                                    Date emplBirthDate = empl.getBirthDate();
+                                    if ((emplFirstName.equals(firstName.toLowerCase()) &&
+                                            emplLastName.equals(lastName.toLowerCase()) ||
+                                            emplFirstName.equals(lastName.toLowerCase()) &&
+                                            emplLastName.equals(firstName.toLowerCase())) &&
+                                            (birthday == null || emplBirthDate == null || emplBirthDate.equals(birthday))) {
+                                        corEmps.add(empl);
+                                    }
+                                }
+                            }
+
+                            //Поиск подразделения в базе для нового или изменяемого сотрудника
+                            String departmentId = (String) jsonMap.get("department_id");
+                            LoadContext depCtx = new LoadContext(Department.class);
+
+                            depCtx.setView("edit");
+                            if ("65".equals(departmentId)) {
+                                depCtx.setQueryString("select d from " +
+                                        "df$Department d where d.code = '002'");
+                            } else {
+                                depCtx.setQueryString("select d from " +
+                                        "df$Department d where d.code like '%-" + departmentId
+                                        + "'");
+                            }
+                            Department dep = dataManager.load(depCtx);
+
+                            Object p = jsonMap.get("position");
+                            String position = p != null ? ((String) p).toLowerCase() : "";
+
+                            //Поиск должности для нового или изменяемого сотрудника
+                            Position newPos;
+                            if (dep != null) {
+                                if (dep.getCode() != null && dep.getCode().startsWith("1")) {
+                                    switch (position) {
+                                        case "менеджер по продажам":
+                                            newPos = manager;
+                                            break;
+                                        case "старший менеджер":
+                                            newPos = majorMngr;
+                                            break;
+                                        case "менеджер-эксперт":
+                                            newPos = expMngr;
+                                            break;
+                                        case "старший менеджер-эксперт":
+                                            newPos = majorExpMngr;
+                                            break;
+                                        case "руководитель группы продаж":
+                                            newPos = headMngr;
+                                            break;
+                                        case "руководитель автосалона":
+                                            newPos = dealershipHead;
+                                            break;
+                                        case "техник":
+                                            newPos = tech;
+                                            break;
+                                        case "специалист по предпродажной подготовке":
+                                            newPos = prepairSpec;
+                                            break;
+                                        case "старший специалист по предпродажной подготовке":
+                                            newPos = majorPrepairSpec;
+                                            break;
+                                        case "руководитель отдела предпродажной подготовки":
+                                            newPos = prepairSpecHead;
+                                            break;
+                                        default:
+                                            if (position.contains("руководит") &&
+                                                    position.contains("площадк")) {
+                                                newPos = dealershipHead;
+                                            } else {
+                                                if (dep.getCode().startsWith("109")) {
+                                                    newPos = prepairSpec;
+                                                } else {
+                                                    newPos = manager;
+                                                }
+                                            }
+                                            break;
+                                    }
+                                } else if (dep.getCode() != null && dep.getCode().startsWith("006")) {
+                                    switch (position) {
+                                        case "инспектор службы экономической безопасности":
+                                            newPos = safetySpec;
+                                            break;
+                                        case "старший специалист службы экономической " +
+                                             "безопасности":
+                                            newPos = majorSafetySpec;
+                                            break;
+                                        default:
+                                            newPos = safetySpec;
+                                            break;
+                                    }
+                                } else {
+                                    switch (position) {
+                                        case "специалист отдела кредитования, страхования и " +
+                                                "оформления":
+                                            newPos = creditWorker;
+                                            break;
+                                        case "старший специалист отдела кредитования, " +
+                                                "страхования и оформления":
+                                            newPos = majorCreditWorker;
+                                            break;
+                                        case "начальник отдела":
+                                            newPos = departmentChief;
+                                            break;
+                                        default:
+                                            newPos = creditWorker;
+                                            break;
+                                    }
+                                }
+
+                                String middleName = (String) jsonMap.get("second_name");
+                                String phone = (String) jsonMap.get("phone");
+
+                                Object s = jsonMap.get("sex");
+                                SexEnum sex = s instanceof String ? SexEnum.fromId((String) s) : null;
+
+                                if (corEmps.size() == 0) {
+
+                                    //Создание сотрудника из JSONа, полученного из "Bitrix", если его
+                                    // нет в базе "Тезиса"
+
+                                    ExtEmployee newEmp = metadata.create(ExtEmployee.class);
+
+                                    newEmp.setLastName(lastName);
+                                    newEmp.setFirstName(firstName);
+                                    newEmp.setMiddleName(middleName);
+                                    newEmp.setName(UserUtils.formatName(pattern, newEmp.getFirstName(),
+                                            newEmp.getLastName(), newEmp.getMiddleName()));
+                                    newEmp.setPhone(phone);
+
+                                    newEmp.setBirthday(birthday);
+
+                                    newEmp.setSex(sex);
+
+                                    newEmp.setDepartment(dep);
+                                    newEmp.setPosition(newPos);
+
+                                    newEmp.setOrganization(dep.getOrganization());
+
+                                    EmployeeDepartmentPositionRelation edpr =
+                                            newEmp.getEmployeeDepartmentPositionRelations().get(0);
+                                    edpr.setDepartment(dep);
+                                    edpr.setPosition(newEmp.getPosition());
+                                    newEmp.setStatus(EmployeeStatus.active);
+
+                                    dataManager.commit(newEmp);
+
+
+                                } else {
+                                    //Если совпадения есть, то происходит уточнение данных сотрудников
+                                    for (Object e : corEmps) {
+                                        if (e instanceof ExtEmployee) {
+                                            ExtEmployee empl = (ExtEmployee) e;
+
+                                            //Телефон, дата рождения, отчество сраниваются с имеющимися и при
+                                            // несовпадении записываются из json
+
+                                            if (phone != null && !"".equals(phone) &&
+                                                    !phone.equals(empl.getPhone())) {
+                                                empl.setPhone(phone);
+                                            }
+                                            if (middleName != null && !"".equals(middleName) &&
+                                                    "".equals(empl.getMiddleName())) {
+                                                empl.setMiddleName(middleName);
+                                            }
+
+                                            //У существующего сотрудника берется список подразделений-должностей
+                                            List edprList = empl.getEmployeeDepartmentPositionRelations();
+                                            EmployeeDepartmentPositionRelation edpr =
+                                                    (EmployeeDepartmentPositionRelation)edprList.get(0);
+
+                                            //Если подразделение для сотрудника в json найдено, то совершается проход
+                                            // по списку подразделения-должностей имеющегося сотрудника. Если в этом
+                                            // списке находится подразделение, код которого совпадает с
+                                            // подразделением сотрудника из json, то выставляется флаг актуальности и
+                                            // запоминается это подразделение-должность
+                                            if (dep.getCode() != null && !"".equals(dep.getCode())) {
+                                                boolean upToDateDep = false;
+                                                for (Object depPos : edprList) {
+                                                    if (depPos instanceof EmployeeDepartmentPositionRelation) {
+                                                        EmployeeDepartmentPositionRelation ed =
+                                                                (EmployeeDepartmentPositionRelation) depPos;
+                                                        if (ed.getDepartment().getCode()
+                                                                .equals(dep.getCode())) {
+                                                            upToDateDep = true;
+                                                            edpr = ed;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+
+                                                //Если флаг актуальности false, то в сотрудника устанавливается
+                                                // подразделение из json (в нулевой элемент списка
+                                                // подразделений-должностей имеющегося сотрудника)
+                                                if (!upToDateDep) {
+                                                    empl.setDepartment(dep);
+                                                    edpr.setDepartment(dep);
+                                                    dataManager.commit(edpr);
+                                                }
+
+                                            }
+
+                                            //
+                                            if (!"".equals(position) && !Objects.equals(edpr.getPosition(), newPos)) {
+                                                empl.setPosition(newPos);
+                                                edpr.setPosition(newPos);
+                                                dataManager.commit(edpr);
+                                            }
+                                            if (sex != null && !sex.equals(empl.getSex())) {
+                                                empl.setSex(sex);
+                                            }
+                                            dataManager.commit(empl);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            authentication.end();
+        }
+    }
+    
+    @Authenticated
+    public String loadBitrixEmployees(String needsUpdatingPositions) {
+        boolean updatePositions = Boolean.getBoolean(needsUpdatingPositions);
+        DataManager dataManager = AppBeans.get(DataManager.NAME);
+        Metadata metadata = AppBeans.get(Metadata.NAME);
+        Log log = LogFactory.getLog("Loading employees from Bitrix CRM");
+        String pattern = AppContext.getProperty("cuba.user.fullNamePattern");
+        if (StringUtils.isBlank(pattern)) {
+            pattern = DEFAULT_NAME_PATTERN;
+        }
+        StringBuilder result = new StringBuilder();
+        int added = 0;
+        int checked = 0;
+        int fired = 0;
+        int loaded = 0;
+        int updated = 0;
+        int reinstated = 0;
+        log.debug("Started...");
+        
+        //Здесь должно быть обновление подразделений менеджеров...
+    
+        //Загружаем список должностей из "Тезис"
+        LoadContext posCtx = new LoadContext(Position.class);
+        posCtx.setView("_local").setQueryString("select p from df$Position p");
+    
+        List<Position> posList = dataManager.loadList(posCtx);
+        
+        LoadContext thEmpCtx = new LoadContext(ExtEmployee.class);
+        ViewRepository vr = metadata.getViewRepository();
+        thEmpCtx.setView(vr.getView(ExtEmployee.class, "edit")
+            .addProperty("employeeDepartmentPositionRelations",
+            vr.getView(EmployeeDepartmentPositionRelation.class, "with-synch")))
+            .setQueryString("select e from thesisab$Employee e");
+        Set<ExtEmployee> thesisEmps = new HashSet<>(dataManager.<ExtEmployee>loadList(thEmpCtx));
+        
+       
+        HttpSender httpSender = AppBeans.get(HttpSender.class);
+        Map<String, Object> paramsMap = new HashMap<>();
+        
+        Map resultMap = httpSender
+            .sendGetAndGetJSON(HttpSender.LOADING_USERS_FROM_BITRIX, paramsMap,
+                null, null, null);
+        
+        if (resultMap != null) {
+            String message = resultMap.get("message").toString();
+            if (!StringUtils.equalsIgnoreCase(message, "OK")) {
+                String errorStateMsg = "Received error state in response";
+                log.error(errorStateMsg);
+                return errorStateMsg;
+            }
+            if (!(resultMap.get("data") instanceof Map)) {
+                String noMapMsg = "Received data is not a map";
+                log.error(noMapMsg);
+                return noMapMsg;
+            }
+            Map dataMap = (Map) resultMap.get("data");
+            if (dataMap.size() == 0) {
+                String noEmpMsg = "Received empty map";
+                log.error(noEmpMsg);
+                return noEmpMsg;
+            }
+            if (!(dataMap.get("departaments") instanceof JSONArray)) {
+                String noDepartmentsMsg = "Received no departments";
+                log.error(noDepartmentsMsg);
+            }
+            JSONArray bitrixDepartments = (JSONArray) dataMap.get("departaments");
+            if (!(dataMap.get("users") instanceof JSONArray)) {
+                String noUsersMsg = "Received no users";
+                log.error(noUsersMsg);
+                return noUsersMsg;
+            }
+
+            //Обновление списка подразделений
+            LoadContext mngGroupCtx = new LoadContext(ExtDepartment.class);
+            mngGroupCtx.setView("edit").setQueryString("select dep from thesisab$Department dep");
+            List<ExtDepartment> thDeps = new ArrayList<>(dataManager.<ExtDepartment>loadList(mngGroupCtx));
+
+            for (Object json : bitrixDepartments) {
+                if (json instanceof Map) {
+                    Map bitrixDepartment = (Map)json;
+                    Long depId = CardHelper.getCheckedLongValue(bitrixDepartment.get("ID"));
+                    boolean departmentIsPresent = false;
+                    if (depId != null) {
+                        ListIterator<ExtDepartment> departmentListIterator = thDeps.listIterator();
+                        while (departmentListIterator.hasNext()) {
+                            ExtDepartment thDep = departmentListIterator.next();
+                            if (depId.equals(thDep.getBitrixId())) {
+                                departmentIsPresent = true;
+                            }
+                        }
+                        Long parentDepId = CardHelper.getCheckedLongValue(bitrixDepartment.get("PARENT_ID"));
+                        LoadContext depCtx = new LoadContext(ExtDepartment.class);
+                        depCtx.setView("edit").setQueryString("select dep from thesisab$Department dep " +
+                                "where dep.bitrixId = :bitrixId")
+                                .setParameter("bitrixId", parentDepId);
+                        List<ExtDepartment> departments = dataManager.loadList(depCtx);
+                        ExtDepartment parentDep = null;
+                        Organization organization = null;
+                        if (CollectionUtils.isNotEmpty(departments)) {
+                            parentDep = departments.get(0);
+                            organization = parentDep.getOrganization();
+                        } else {
+                            LoadContext mainDepCtx = new LoadContext(ExtDepartment.class);
+                            mainDepCtx.setView("_minimal").setQueryString("select dep from thesisab$Department dep " +
+                                    "where dep.code = :mainDepId and dep.organization.code = :orgCode")
+                                    .setParameter("mainDepId", "000")
+                                    .setParameter("orgCode", "001");
+                            ExtDepartment mainDep = dataManager.load(mainDepCtx);
+                            if (mainDep != null) {
+                                parentDep = mainDep;
+                                organization = mainDep.getOrganization();
+                            }
+                        }
+
+                        if (!departmentIsPresent) {
+                            ExtDepartment newDep = metadata.create(ExtDepartment.class);
+                            newDep.setBitrixId(depId);
+                            newDep.setNeedsSynchronizationWithCrm(true);
+                            newDep.setName(CardHelper.getCheckedStringValue(bitrixDepartment.get("NAME")));
+                            newDep.setParentDepartment(parentDep);
+                            newDep.setOrganization(organization);
+                            String codePrefix;
+                            if (newDep.getParentDepartment() != null) {
+                                codePrefix = StringUtils.substring(newDep.getParentDepartment().getCode(), 0, 3);
+                            } else {
+                                codePrefix = "000";
+                            }
+                            newDep.setCode(codePrefix + newDep.getBitrixId());
+                            dataManager.commit(newDep);
+                        }
+                    }
+                }
+            }
+
+            JSONArray bitrixUsers = (JSONArray) dataMap.get("users");
+            for (Object o : bitrixUsers) {
+                if (o instanceof Map) {
+                    Map bitrixEmp = (Map) o;
+                    String bLastName = CardHelper.getCheckedStringValue(bitrixEmp.get("LAST_NAME"));
+                    if (bLastName != null) {
+                        bLastName = bLastName.trim();
+                    }
+                    String bFirstName = CardHelper.getCheckedStringValue(bitrixEmp.get("NAME"));
+                    if (bFirstName != null) {
+                        bFirstName = bFirstName.trim();
+                    }
+                    String bMiddleName = CardHelper.getCheckedStringValue(bitrixEmp.get("SECOND_NAME"));
+                    if (bMiddleName != null) {
+                        bMiddleName = bMiddleName.trim();
+                    }
+                    if (StringUtils.isEmpty(bLastName) || StringUtils.isEmpty(bFirstName)) {
+                        continue;
+                    }
+                    SimpleDateFormat simpleDateFormat = new SimpleDateFormat("dd.MM.yyyy");
+                    String bBirthDateString = CardHelper
+                            .getCheckedStringValue(bitrixEmp.get("PERSONAL_BIRTHDAY"));
+                    Date bBirthDate = bBirthDateString != null ?
+                            simpleDateFormat.parse(bBirthDateString, new ParsePosition(0)) : null;
+                    String bEmail = CardHelper.getCheckedStringValue(bitrixEmp.get("EMAIL"));
+                    if (bEmail != null) {
+                        bEmail = bEmail.trim();
+                    }
+                    /*Integer subOfficeId = CardHelper
+                            .getCheckedIntValue(bitrixEmp.get("suboffice_id"));*/
+                    String bGender = CardHelper.getCheckedStringValue(bitrixEmp.get("PERSONAL_GENDER"));
+                    SexEnum bSex = SexEnum.fromId(bGender);
+                    Long bitrixId = CardHelper.getCheckedLongValue(bitrixEmp.get("ID"));
+                    String bPosition = CardHelper.getCheckedStringValue(bitrixEmp.get("WORK_POSITION"));
+                    if (bPosition != null) {
+                        bPosition = bPosition.trim();
+                    }
+                    //Переделать на прием подразделения в JSONArray!
+                    JSONArray bDepIdsArray = null;
+                    List<Long> bDepIds = new ArrayList<>();
+                    if (bitrixEmp.get("UF_DEPARTMENT") instanceof JSONArray) {
+                        bDepIdsArray = (JSONArray)bitrixEmp.get("UF_DEPARTMENT");
+                        for (Object json : bDepIdsArray) {
+                            if (json instanceof Integer) {
+                                bDepIds.add(Long.valueOf((Integer)json));
+                            }
+                        }
+                    }
+
+                    String bActiveString =
+                        CardHelper.getCheckedStringValue(bitrixEmp.get("ACTIVE"));
+                    Boolean bActive = StringUtils.equals(bActiveString, "Y");
+                    //Подбираем подразделение из базы
+                    LoadContext depCtx = new LoadContext(ExtDepartment.class);
+                    depCtx.setView("edit").setQueryString("select dep from " +
+                            "thesisab$Department dep");
+                    List<ExtDepartment> departments = dataManager.loadList(depCtx);
+                    List<ExtDepartment> bDeps = new ArrayList<>();
+                    for (ExtDepartment department : departments) {
+                        if (bDepIds.contains(department.getBitrixId())) {
+                            bDeps.add(department);
+                        }
+                    }
+                    if (CollectionUtils.isEmpty(bDeps)) {
+                        //Если подразделения с таким bitrixId не существует в базе, то
+                        // помещаем работника в специальное подразделение для последующего
+                        // ручного распределения
+                        depCtx.setQueryString("select dep from thesisab$Department dep where " +
+                                "dep.code = 'default'");
+                        bDeps.add(dataManager.<ExtDepartment>load(depCtx));
+                    }
+
+                    //Подбираем нужную должность
+                    Position bPos = null;
+                    for (Position position : posList) {
+                        if (position.getName().equalsIgnoreCase(bPosition)) {
+                            bPos = position;
+                            break;
+                        }
+                    }
+                    boolean dealershipChief = StringUtils.containsIgnoreCase(bPosition,
+                            DEALERSHIP_CHIEF_TOKEN);
+                    boolean defCreditWorker = StringUtils.containsIgnoreCase(bPosition,
+                            CREDIT_WORKER_TOKEN);
+                    boolean defManager = StringUtils.containsIgnoreCase(bPosition,
+                            MANAGER_TOKEN);
+                    boolean defTechWorker = StringUtils.containsIgnoreCase(bPosition,
+                            TECH_WORKER_TOKEN);
+                    Position typedPosition = null;
+                    for (Position position : posList) {
+                        if (defCreditWorker &&
+                                StringUtils.equalsIgnoreCase(position
+                                        .getName(), CREDIT_WORKER) ||
+                                dealershipChief && StringUtils.equalsIgnoreCase(position
+                                        .getName(), DEALERSHIP_CHIEF) ||
+                                defManager && StringUtils.equalsIgnoreCase(position
+                                        .getName(), MANAGER) ||
+                                defTechWorker && StringUtils.equalsIgnoreCase(position
+                                        .getName(), TECH_WORKER) ||
+                                !defCreditWorker && !defManager &&
+                                        !defTechWorker && !dealershipChief &&
+                                        StringUtils.equalsIgnoreCase(position.getName(), MANAGER)) {
+                            typedPosition = position;
+                            break;
+                        }
+                    }
+
+                    String bWorkPhone = CardHelper.getCheckedStringValue(bitrixEmp.get("WORK_PHONE"));
+                    String bPersonalPhone = CardHelper.getCheckedStringValue(bitrixEmp.get("PERSONAL_PHONE"));
+
+                    boolean isPresent = false;
+                    Iterator<ExtEmployee> iterator = thesisEmps.iterator();
+                    //Перебор списка сотрудников в базе "Тезис" и сравнение каждого с полученным
+                    // из CRM
+                    while (iterator.hasNext()) {
+                        ExtEmployee thEmp = iterator.next();
+                        boolean needsSynch = false;
+                        if (CollectionUtils.isEmpty(thEmp.getEmployeeDepartmentPositionRelations())) {
+                            needsSynch = true;
+                        } else {
+                            for (EmployeeDepartmentPositionRelation edpr :
+                                    thEmp.getEmployeeDepartmentPositionRelations()) {
+                                if (edpr.getDepartment() instanceof ExtDepartment &&
+                                        ((ExtDepartment) edpr.getDepartment()).getNeedsSynchronizationWithCrm() &&
+                                        !thEmp.getDoesntNeedSynchronizationWithCrm() ||
+                                        edpr.getDepartment() == null) {
+                                    needsSynch = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        //1) Случай, когда сотрудник из списка Bitrix найден в базе Thesis
+                        if (thEmp.getBitrixId() != null && thEmp.getBitrixId().equals(bitrixId) ||
+                                (thEmp.getBitrixId() == null || thEmp.getBitrixId() == 0) &&
+                                    (thEmp.getEmail() != null && thEmp.getEmail().equals(bEmail) ||
+                                            thEmp.getLastName() != null && thEmp.getFirstName() != null &&
+                                                    (thEmp.getLastName().equalsIgnoreCase(bLastName) &&
+                                                    thEmp.getFirstName().equalsIgnoreCase(bFirstName) ||
+                                                            thEmp.getLastName().equalsIgnoreCase(bFirstName) &&
+                                                            thEmp.getFirstName().equalsIgnoreCase(bLastName)) &&
+                                                    (thEmp.getBirthDate() != null &&
+                                                            thEmp.getBirthDate().equals(bBirthDate) ||
+                                                            thEmp.getBirthDate() == null || bBirthDate == null))) {
+                            isPresent = true;
+
+                            //обновление полей...
+                            if (needsSynch) {
+                                class ValueChangeListener implements ValueListener {
+                                    private boolean changed;
+
+                                    public ValueChangeListener() {
+                                        changed = false;
+                                    }
+
+                                    public boolean getChanged() {
+                                        return changed;
+                                    }
+
+                                    @Override
+                                    public void propertyChanged(Object item, String property,
+                                                                Object prevValue, Object value) {
+                                        changed = true;
+                                    }
+                                }
+                                ValueChangeListener changeListener = new ValueChangeListener();
+                                thEmp.addListener(changeListener);
+                                if (StringUtils.isNotEmpty(bMiddleName) &&
+                                        !StringUtils.equalsIgnoreCase(thEmp.getMiddleName(), bMiddleName)) {
+                                    thEmp.setMiddleName(bMiddleName);
+                                }
+                                if (bBirthDate != null &&
+                                        !bBirthDate.equals(thEmp.getBirthDate())) {
+                                    thEmp.setBirthDate(bBirthDate);
+                                }
+                                if (bSex != null && !bSex.equals(thEmp.getSex())) {
+                                    thEmp.setSex(bSex);
+                                }
+                                if (StringUtils.isEmpty(thEmp.getPhone())) {
+                                    if (StringUtils.isNotEmpty(bWorkPhone)) {
+                                        thEmp.setPhone(bWorkPhone);
+                                    } else if (StringUtils.isNotEmpty(bPersonalPhone)) {
+                                        thEmp.setPhone(bPersonalPhone);
+                                    }
+                                }
+
+                                if (StringUtils.isNotEmpty(bEmail) && StringUtils.isEmpty(thEmp.getEmail())) {
+                                    thEmp.setEmail(bEmail);
+                                }
+                                if (thEmp.getBitrixId() == null ||
+                                    !thEmp.getBitrixId().equals(bitrixId)) {
+                                    thEmp.setBitrixId(bitrixId);
+                                }
+                                //Проверяем подразделения-должности у сотрудника из "Тезис"
+                                ListIterator<ExtDepartment> depIterator = bDeps.listIterator();
+                                List<EmployeeDepartmentPositionRelation> actualEdprs =
+                                                new ArrayList<>();
+                                while (depIterator.hasNext()) {
+                                    //count++;
+                                    ExtDepartment bDep = depIterator.next();
+                                    boolean hasSuchDep = false;
+                                    if (CollectionUtils.isNotEmpty(thEmp
+                                            .getEmployeeDepartmentPositionRelations())) {
+                                        for (EmployeeDepartmentPositionRelation edpr :
+                                                thEmp.getEmployeeDepartmentPositionRelations()) {
+                                            if (bDep.equals(edpr.getDepartment())) {
+                                                actualEdprs.add(edpr);
+                                                hasSuchDep = true;
+                                                Position defPos =
+                                                        ((ExtDepartment)edpr.getDepartment()).getDefaultPosition();
+                                                Position position;
+                                                if (bPos != null) {
+                                                    position = bPos;
+                                                } else {
+                                                    position = defPos != null ? defPos : typedPosition;
+                                                }
+                                                if (updatePositions && position != null &&
+                                                        !position.equals(edpr.getPosition())) {
+                                                    edpr.setPosition(position);
+                                                }
+                                                dataManager.commit(edpr);
+                                                break;
+                                            }
+                                        }
+
+                                    }
+                                    if (!hasSuchDep) {
+                                        if (thEmp.getEmployeeDepartmentPositionRelations() != null) {
+                                            EmployeeDepartmentPositionRelation edpr =
+                                                    metadata.create(EmployeeDepartmentPositionRelation.class);
+                                            Position defPos = bDep.getDefaultPosition();
+                                            Position position;
+                                            if (bPos != null) {
+                                                position = bPos;
+                                            } else {
+                                                position = defPos != null ? defPos : typedPosition;
+                                            }
+                                            if (position != null) {
+                                                edpr.setPosition(position);
+                                            }
+                                            edpr.setPosition(position);
+                                            edpr.setDepartment((ExtDepartment)bDep);
+                                            edpr.setEmployee(thEmp);
+                                            thEmp.getEmployeeDepartmentPositionRelations().add(edpr);
+                                            actualEdprs.add(dataManager.commit(edpr));
+                                        }
+                                    }
+
+                                }
+                                if (CollectionUtils.isNotEmpty(thEmp.getEmployeeDepartmentPositionRelations())) {
+                                    ListIterator<EmployeeDepartmentPositionRelation> edprIterator =
+                                            thEmp.getEmployeeDepartmentPositionRelations().listIterator();
+                                    boolean hasMain = false;
+                                    while (edprIterator.hasNext()) {
+                                        EmployeeDepartmentPositionRelation edpr = edprIterator.next();
+                                        if (actualEdprs.contains(edpr)) {
+                                            if (edpr.getMain()) {
+                                                Position position = edpr.getPosition();
+                                                ExtDepartment department = (ExtDepartment) edpr.getDepartment();
+                                                Organization organization = edpr.getDepartment().getOrganization();
+                                                hasMain = true;
+                                                if (updatePositions && position != null &&
+                                                        !position.equals(thEmp.getPosition())) {
+                                                    thEmp.setPosition(position);
+                                                }
+                                                if (!department.equals(thEmp.getDepartment())) {
+                                                    thEmp.setDepartment(department);
+                                                }
+                                                if (!organization.equals(thEmp.getOrganization())) {
+                                                    thEmp.setOrganization(organization);
+                                                }
+                                            }
+                                        } else {
+                                            dataManager.remove(edpr);
+                                            edprIterator.remove();
+                                        }
+                                    }
+
+                                    if (!hasMain) {
+                                        EmployeeDepartmentPositionRelation edpr =
+                                                thEmp.getEmployeeDepartmentPositionRelations().get(0);
+                                        edpr.setMain(true);
+                                        if (thEmp.getDepartment() == null ||
+                                                !thEmp.getDepartment().equals(edpr.getDepartment())) {
+                                            thEmp.setDepartment(edpr.getDepartment());
+                                        }
+                                        dataManager.commit(edpr);
+                                    }
+                                }
+
+                                //И отмечаем как активного сотрудника, если он был восстановлен
+                                if (EmployeeStatus.fired.equals(thEmp.getStatus()) && bActive) {
+                                    thEmp.setStatus(EmployeeStatus.active);
+                                    reinstated++;
+                                } else if (EmployeeStatus.active.equals(thEmp.getStatus()) && !bActive) {
+                                    thEmp.setStatus(EmployeeStatus.fired);
+                                    if (thEmp.getUser() != null) {
+                                        thEmp.getUser().setActive(false);
+                                        dataManager.commit(thEmp.getUser());
+                                    }
+                                    fired++;
+                                }
+                                if (changeListener.getChanged()) {
+                                    updated++;
+                                }
+                                checked++;
+                                dataManager.commit(thEmp);
+                            }
+                            iterator.remove();
+                        }
+                    }
+                    //2) Случай, когда сотрудник отсутствует в базе Thesis, и мы его добавляем
+                    if (!isPresent && bActive) {
+                        ExtEmployee newThEmp = metadata.create(ExtEmployee.class);
+                        newThEmp.setLastName(bLastName);
+                        newThEmp.setFirstName(bFirstName);
+                        newThEmp.setMiddleName(bMiddleName);
+                        try {
+                            newThEmp.setName(UserUtils.formatName(pattern,
+                                    newThEmp.getFirstName(), newThEmp.getLastName(), newThEmp.getMiddleName()));
+                        } catch (ParseException e) {
+                            log.error("Parse problem with Bitrix ID = " + bitrixId + ", " +
+                                    "error offset = " + e.getErrorOffset());
+                            log.error(e.getMessage());
+                        }
+                        newThEmp.setBirthDate(bBirthDate);
+                        newThEmp.setPhone(bWorkPhone);
+                        newThEmp.setBitrixId(bitrixId);
+                        newThEmp.setStatus(EmployeeStatus.active);
+                        newThEmp.setSex(bSex);
+                        newThEmp.setEmail(bEmail);
+                        List<EmployeeDepartmentPositionRelation> edprs = new ArrayList<>();
+                        int count = 0;
+                        for (ExtDepartment department : bDeps) {
+                            EmployeeDepartmentPositionRelation edpr =
+                                    metadata.create(EmployeeDepartmentPositionRelation.class);
+                            edpr.setEmployee(newThEmp);
+                            edpr.setDepartment(department);
+                            Position defPos =
+                                    ((ExtDepartment)edpr.getDepartment()).getDefaultPosition();
+                            Position position;
+                            if (bPos != null) {
+                                position = bPos;
+                            } else {
+                                position = defPos != null ? defPos : typedPosition;
+                            }
+                            edpr.setPosition(position);
+                            edpr.setMain(count == 0);
+                            if (count == 0) {
+                                edpr.setMain(true);
+                                newThEmp.setPosition(edpr.getPosition());
+                                newThEmp.setDepartment(edpr.getDepartment());
+                                newThEmp.setOrganization(edpr.getDepartment().getOrganization());
+                            }
+                            edprs.add(edpr);
+                            count++;
+                        }
+                        newThEmp.setEmployeeDepartmentPositionRelations(edprs);
+                        dataManager.commit(newThEmp);
+                        added++;
+                    }
+                    loaded++;
+
+
+                }
+            }
+
+            //3) Случай отсутствия сотрудника в сообщении Bitrix (то есть когда сотрудник
+            // добавлен только в "Тезис")
+            for (ExtEmployee employee : thesisEmps) {
+                if (EmployeeStatus.fired.equals(employee.getStatus())) {
+                    continue;
+                }
+                boolean needsSynch = false;
+                for (EmployeeDepartmentPositionRelation edpr :
+                        employee.getEmployeeDepartmentPositionRelations()) {
+                    if (edpr.getDepartment() instanceof ExtDepartment &&
+                            ((ExtDepartment) edpr.getDepartment()).getNeedsSynchronizationWithCrm() &&
+                            !employee.getDoesntNeedSynchronizationWithCrm()) {
+                        needsSynch = true;
+                        break;
+                    }
+                }
+                if (needsSynch) {
+                    employee.setStatus(EmployeeStatus.fired);
+                    if (employee.getUser() != null) {
+                        employee.getUser().setActive(false);
+                        dataManager.commit(employee.getUser());
+                    }
+                    fired++;
+                }
+            }
+            dataManager.commit(new CommitContext(thesisEmps));
+
+            //Теперь нужно пройти по всем группам менеджеров и обновить название группы,
+            //потому что оно должно содержать Отображаемое имя Руководителя группы продаж в этой
+            //группе:
+            for (ExtDepartment dep : thDeps) {
+                if (!dep.getNeedsSynchronizationWithCrm()) {
+                    continue;
+                }
+                Long chiefId;
+                ExtEmployee headEmp = null;
+                for (Object json : bitrixDepartments) {
+                    if (json instanceof Map) {
+                        Map bitrixDepartment = (Map)json;
+                        Long depId = CardHelper.getCheckedLongValue(bitrixDepartment.get("ID"));
+                        if (depId != null) {
+                            if (depId.equals(dep.getBitrixId())) {
+                                chiefId = CardHelper.getCheckedLongValue(bitrixDepartment.get("HEAD_USER_ID"));
+                                if (chiefId != null) {
+                                    LoadContext empCtx = new LoadContext(ExtEmployee.class);
+                                    empCtx.setView("_local").setQueryString("select emp from thesisab$Employee emp " +
+                                            "where emp.bitrixId = :bitrixId ")
+                                            .setParameter("bitrixId", chiefId);
+                                    headEmp = dataManager.load(empCtx);
+                                    dep.setHeadEmployee(headEmp);
+                                }
+                            }
+                        }
+                    }
+                }
+                String chiefName = headEmp != null ? headEmp.getName() : "";
+                StringBuilder depName = new StringBuilder();
+                if (StringUtils.containsIgnoreCase(dep.getName(), MANAGER_GROUP)) {
+                    depName.append(StringUtils.capitalize(MANAGER_GROUP));
+                    if (StringUtils.isNotEmpty(chiefName)) {
+                        depName.append(" (").append(chiefName).append(")");
+                    }
+                    dep.setName(depName.toString());
+                }
+                dataManager.commit(dep);
+            }
+
+            result.append("Loaded ").append(loaded).append(" employees: \n")
+                    .append("added: ").append(added).append(";\n")
+                    .append("checked: ").append(checked).append(";\n")
+                    .append("updated: ").append(updated).append(";\n")
+                    .append("reinstated: ").append(reinstated).append(";\n")
+                    .append("fired: ").append(fired).append(".");
+
+            log.debug("Finished successfully:\n" + result.toString());
+        } else {
+            String receivedNullMsg = "Error: received null response";
+            result.append(receivedNullMsg);
+            log.error(receivedNullMsg);
+        }
+
+        return result.toString();
+    }
+    
+    @Authenticated
+    public String cleanBitrixIdsInEmployees() {
+        DataManager dataManager = AppBeans.get(DataManager.NAME);
+        StringBuilder result = new StringBuilder();
+        LoadContext ctx = new LoadContext(ExtEmployee.class);
+        ctx.setView("_local").setQueryString("select em from thesisab$Employee em");
+        List<ExtEmployee> employees = dataManager.loadList(ctx);
+        int deleted = 0;
+        for (ExtEmployee employee : employees) {
+            employee.setBitrixId(null);
+            deleted++;
+        }
+        dataManager.commit(new CommitContext(employees));
+        result.append("Deleted ").append(deleted).append(" Bitrix IDs.");
+        return result.toString();
+    }
+
+    @Deprecated
+    @Authenticated
+    public String loadIntrumEmployees() {
+        DataManager dataManager = AppBeans.get(DataManager.NAME);
+        Metadata metadata = AppBeans.get(Metadata.NAME);
+        Log log = LogFactory.getLog("Loading employees from Intrum CRM");
+        String pattern = AppContext.getProperty("cuba.user.fullNamePattern");
+        if (StringUtils.isBlank(pattern)) {
+            pattern = DEFAULT_NAME_PATTERN;
+        }
+        StringBuilder result = new StringBuilder();
+        int added = 0;
+        int checked = 0;
+        int fired = 0;
+        int loaded = 0;
+        int updated = 0;
+        int reinstated = 0;
+        log.debug("Started...");
+
+        //Загружаем список должностей из "Тезис"
+        LoadContext posCtx = new LoadContext(Position.class);
+        posCtx.setView("_local").setQueryString("select p from df$Position p");
+
+        List<Position> posList = dataManager.loadList(posCtx);
+
+        LoadContext thEmpCtx = new LoadContext(ExtEmployee.class);
+        ViewRepository vr = metadata.getViewRepository();
+        thEmpCtx.setView(vr.getView(ExtEmployee.class, "edit")
+                .addProperty("employeeDepartmentPositionRelations",
+                        vr.getView(EmployeeDepartmentPositionRelation.class, "with-synch")))
+                .setQueryString("select e from thesisab$Employee e");
+        Set<ExtEmployee> thesisEmps = new HashSet<>(dataManager.<ExtEmployee>loadList(thEmpCtx));
+
+        IntrumAPIConfig config =
+                ((Configuration)AppBeans.get(Configuration.NAME)).getConfig(IntrumAPIConfig.class);
+        HttpSender httpSender = AppBeans.get(HttpSender.class);
+        JsonSmartJsonProvider jsonSmartJsonProvider = new JsonSmartJsonProvider();
+        StringBuilder url = new StringBuilder(config.getIntrumScriptUrl()).append("worker/filter");
+        String header = "application/x-www-form-urlencoded";
+        Map<String, Object> postParams = new HashMap<>();
+        postParams.put("apikey", config.getIntrumApiKey());
+
+        Map resultMap = httpSender.sendPostAndGetJSON(url.toString(), header, postParams);
+
+        if (resultMap != null) {
+            String status = resultMap.get("status").toString();
+            if (!StringUtils.equalsIgnoreCase(status, "success")) {
+                String errorStateMsg = "Received error state in response";
+                log.error(errorStateMsg);
+                return errorStateMsg;
+            }
+            if (!(resultMap.get("data") instanceof Map)) {
+                String noMapMsg = "Received data is not a map";
+                log.error(noMapMsg);
+                return noMapMsg;
+            }
+            Map dataMap = (Map) resultMap.get("data");
+            if (dataMap.size() == 0) {
+                String noEmpMsg = "Received empty map of employees";
+                log.error(noEmpMsg);
+                return noEmpMsg;
+            }
+            for (Object o : dataMap.entrySet()) {
+                if (o instanceof Map.Entry) {
+                    Map.Entry entry = (Map.Entry) o;
+                    if (entry.getValue() instanceof Map) {
+                        Map intrEmp = (Map) entry.getValue();
+                        String iLastName = CardHelper.getCheckedStringValue(intrEmp.get("surname"));
+                        String iFirstName = CardHelper.getCheckedStringValue(intrEmp.get("name"));
+                        String iMiddleName = CardHelper.getCheckedStringValue(intrEmp.get("secondname"));
+                        SimpleDateFormat simpleDateFormat = new SimpleDateFormat("yyyy-MM-dd");
+                        String iBirthDateString = CardHelper
+                                .getCheckedStringValue(intrEmp.get("birthday"));
+                        Date iBirthDate = iBirthDateString != null ?
+                                simpleDateFormat.parse(iBirthDateString, new ParsePosition(0)) :
+                                null;
+                        String iEmail = CardHelper.getCheckedStringValue(intrEmp.get("email"));
+                        Integer subOfficeId = CardHelper
+                                .getCheckedIntValue(intrEmp.get("suboffice_id"));
+                        Integer intrumId = CardHelper.getCheckedIntValue(intrEmp.get("id"));
+                        String iPosition = CardHelper.getCheckedStringValue(intrEmp.get("post")).trim();
+                        Integer iDepId = CardHelper.getCheckedIntValue(intrEmp.get("division_id"));
+                        //Подбираем подразделение из базы
+                        LoadContext depCtx = new LoadContext(ExtDepartment.class);
+                        depCtx.setView("edit").setQueryString("select dep from " +
+                                "thesisab$Department dep where dep.intrumId = :intrumId")
+                                .setParameter("intrumId", iDepId);
+                        List<ExtDepartment> departments = dataManager.loadList(depCtx);
+                        ExtDepartment iDep = CollectionUtils.isNotEmpty(departments) ?
+                                departments.get(0) : null;
+                        //Если подразделение нашлось, проверяем, есть ли флаг, что нужна
+                        // синхронизация
+                        if (iDep == null) {
+                            //Если подразделения с таким intrumId не существует в базе, то
+                            // помещаем работника в специальное подразделение для последующего
+                            // ручного распределения
+                            depCtx.setQueryString("select dep from thesisab$Department dep where " +
+                                    "dep.code = 'default'");
+                            iDep = dataManager.load(depCtx);
+                        }
+                        //Подбираем нужную должность
+                        Position iPos = null;
+                        boolean dealershipChief = StringUtils.containsIgnoreCase(iPosition,
+                                DEALERSHIP_CHIEF_TOKEN);
+                        boolean defCreditWorker = StringUtils.containsIgnoreCase(iPosition,
+                                CREDIT_WORKER_TOKEN);
+                        boolean defManager = StringUtils.containsIgnoreCase(iPosition,
+                                MANAGER_TOKEN);
+                        boolean defTechWorker = StringUtils.containsIgnoreCase(iPosition,
+                                TECH_WORKER_TOKEN);
+                        for (Position position : posList) {
+                            if (position.getName().equalsIgnoreCase(iPosition)) {
+                                iPos = position;
+                                break;
+                            }
+                        }
+                        if (iPos == null) {
+                            for (Position position : posList) {
+                                if (defCreditWorker &&
+                                        StringUtils.equalsIgnoreCase(position
+                                                .getName(), CREDIT_WORKER) ||
+                                        dealershipChief && StringUtils.equalsIgnoreCase(position
+                                                .getName(), DEALERSHIP_CHIEF) ||
+                                        defManager && StringUtils.equalsIgnoreCase(position
+                                                .getName(), MANAGER) ||
+                                        defTechWorker && StringUtils.equalsIgnoreCase(position
+                                                .getName(), TECH_WORKER) ||
+                                        !defCreditWorker && !defManager &&
+                                                !defTechWorker && !dealershipChief &&
+                                                StringUtils.equalsIgnoreCase(position.getName(), MANAGER)) {
+                                    iPos = position;
+                                    break;
+                                }
+                            }
+                        }
+                        Object iMobPhones = intrEmp.get("mobilephone");
+                        String iPhone = null;
+                        SexEnum iSex = SexEnum.FEMALE.name()
+                                .equalsIgnoreCase(CardHelper.getCheckedStringValue(intrEmp.get("gender"))) ?
+                                SexEnum.FEMALE : SexEnum.MALE;
+                        if (iMobPhones instanceof JSONArray) {
+                            JSONArray phones = (JSONArray) iMobPhones;
+                            for (Object p : phones) {
+                                if (p instanceof Map) {
+                                    Map iPhoneMap = (Map) p;
+                                    String comment = CardHelper.getCheckedStringValue(iPhoneMap.get("comment"));
+                                    String phone = CardHelper.correctPhoneNumber(CardHelper
+                                            .getCheckedStringValue(iPhoneMap.get("phone")));
+                                    if (StringUtils.equalsIgnoreCase(comment, "корпоративный")) {
+                                        iPhone = phone;
+                                        break;
+                                    } else {
+                                        if (StringUtils.equalsIgnoreCase(comment, "личный")) {
+                                            iPhone = phone;
+                                        }
+                                    }
+
+                                }
+                            }
+                        }
+                        boolean isPresent = false;
+                        Iterator<ExtEmployee> iterator = thesisEmps.iterator();
+                        //Перебо списка сотруднико в вбазе "Тезис" и сравнение каждого с полученными из CRM
+                        while (iterator.hasNext()) {
+                            ExtEmployee thEmp = iterator.next();
+                            boolean needsSynch = false;
+                            for (EmployeeDepartmentPositionRelation edpr :
+                                    thEmp.getEmployeeDepartmentPositionRelations()) {
+                                if (edpr.getDepartment() instanceof ExtDepartment &&
+                                        ((ExtDepartment) edpr.getDepartment()).getNeedsSynchronizationWithCrm() &&
+                                        !thEmp.getDoesntNeedSynchronizationWithCrm()) {
+                                    needsSynch = true;
+                                    break;
+                                }
+                            }
+
+                            //1) Случай, когда сотрудник из списка Intrum найден в базе Thesis
+                            if (thEmp.getIntrumId() != null && thEmp.getIntrumId().equals(intrumId) ||
+                                    (thEmp.getIntrumId() == null || thEmp.getIntrumId() == 0) &&
+                                            thEmp.getLastName() != null &&
+                                            thEmp.getLastName().equalsIgnoreCase(iLastName) &&
+                                            thEmp.getFirstName() != null &&
+                                            thEmp.getFirstName().equalsIgnoreCase(iFirstName) &&
+                                            (thEmp.getBirthDate() != null &&
+                                                    thEmp.getBirthDate().equals(iBirthDate) ||
+                                                    thEmp.getBirthDate() == null)) {
+                                isPresent = true;
+
+                                //обновление полей...
+                                if (needsSynch) {
+                                    class ValueChangeListener implements ValueListener {
+                                        private boolean changed;
+
+                                        public ValueChangeListener() {
+                                            changed = false;
+                                        }
+
+                                        public boolean getChanged() {
+                                            return changed;
+                                        }
+
+                                        @Override
+                                        public void propertyChanged(Object item, String property,
+                                                                    Object prevValue, Object value) {
+                                            changed = true;
+                                        }
+                                    }
+                                    ValueChangeListener changeListener = new ValueChangeListener();
+                                    thEmp.addListener(changeListener);
+                                    if (!StringUtils.equalsIgnoreCase(thEmp.getMiddleName(), iMiddleName)) {
+                                        thEmp.setMiddleName(iMiddleName);
+                                    }
+                                    if (iBirthDate != null &&
+                                            !iBirthDate.equals(thEmp.getBirthDate())) {
+                                        thEmp.setBirthDate(iBirthDate);
+                                    }
+                                    if (!iSex.equals(thEmp.getSex())) {
+                                        thEmp.setSex(iSex);
+                                    }
+                                    if (iPhone != null && !iPhone.equalsIgnoreCase(thEmp.getPhone())) {
+                                        thEmp.setPhone(iPhone);
+                                    }
+                                    if (iEmail != null && !iEmail.equalsIgnoreCase(thEmp.getEmail())) {
+                                        thEmp.setEmail(iEmail);
+                                    }
+                                    if (thEmp.getIntrumId() == null) {
+                                        thEmp.setIntrumId(intrumId);
+                                    }
+                                    //Находим нужное подразделение-должность
+                                    if (iDep != null && CollectionUtils
+                                            .isNotEmpty(thEmp.getEmployeeDepartmentPositionRelations())) {
+                                        boolean hasSuchDep = false;
+                                        EmployeeDepartmentPositionRelation mainEdpr = null;
+                                        for (EmployeeDepartmentPositionRelation edpr :
+                                                thEmp.getEmployeeDepartmentPositionRelations()) {
+                                            if (iDep.equals(edpr.getDepartment())) {
+                                                hasSuchDep = true;
+                                                if (!iPos.equals(edpr.getPosition())) {
+                                                    edpr.setPosition(iPos);
+                                                }
+                                                if (!iPos.equals(thEmp.getPosition())) {
+                                                    thEmp.setPosition(iPos);
+                                                }
+                                                if (!iDep.equals(thEmp.getDepartment())) {
+                                                    thEmp.setDepartment(iDep);
+                                                }
+                                                if (!iDep.getOrganization().equals(thEmp.getOrganization())) {
+                                                    thEmp.setOrganization(iDep.getOrganization());
+                                                }
+                                                if (!edpr.getMain()) {
+                                                    edpr.setMain(true);
+                                                }
+                                                mainEdpr = edpr;
+                                                dataManager.commit(edpr);
+                                                break;
+                                            }
+                                        }
+                                        // Если соответствующее Intrum подразделение нашлось,
+                                        // все другие пары подразделение-должность
+                                        // делаем неглавными
+                                        if (hasSuchDep) {
+                                            for (EmployeeDepartmentPositionRelation edpr :
+                                                    thEmp.getEmployeeDepartmentPositionRelations()) {
+                                                if (!edpr.equals(mainEdpr)) {
+                                                    edpr.setMain(false);
+                                                }
+                                                dataManager.commit(edpr);
+                                            }
+                                        } else {
+                                            //Иначе находим главное подразделение-должность и
+                                            // меняем его в соответствии с Intrum, а также меняем
+                                            // соответствующие поля в самом Сотруднике
+                                            for (EmployeeDepartmentPositionRelation edpr :
+                                                    thEmp.getEmployeeDepartmentPositionRelations()) {
+                                                if (edpr.getMain()) {
+                                                    edpr.setPosition(iPos);
+                                                    edpr.setDepartment(iDep);
+                                                    thEmp.setDepartment(edpr.getDepartment());
+                                                    thEmp.setPosition(edpr.getPosition());
+                                                    thEmp.setOrganization(edpr.getDepartment() != null ?
+                                                            edpr.getDepartment().getOrganization() : null);
+                                                }
+                                                dataManager.commit(edpr);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    //И отмечаем как активного сотрудника, если он был восстановлен
+                                    if (EmployeeStatus.fired.equals(thEmp.getStatus())) {
+                                        thEmp.setStatus(EmployeeStatus.active);
+                                        reinstated++;
+                                    }
+                                    if (changeListener.getChanged()) {
+                                        updated++;
+                                    }
+                                    checked++;
+                                    dataManager.commit(thEmp);
+                                }
+                                iterator.remove();
+                            }
+                        }
+                        //2) Случай, когда сотрудник отсутствует в базе Thesis, и мы его добавляем
+                        if (!isPresent) {
+                            ExtEmployee newThEmp = metadata.create(ExtEmployee.class);
+                            newThEmp.setLastName(iLastName);
+                            newThEmp.setFirstName(iFirstName);
+                            newThEmp.setMiddleName(iMiddleName);
+                            try {
+                                newThEmp.setName(UserUtils.formatName(pattern,
+                                        newThEmp.getFirstName(), newThEmp.getLastName(), newThEmp.getMiddleName()));
+                            } catch (ParseException e) {
+                                log.error("Parse problem with Intrum ID = " + intrumId + ", " +
+                                        "error offset = " + e.getErrorOffset());
+                                log.error(e.getMessage());
+                            }
+                            newThEmp.setBirthDate(iBirthDate);
+                            newThEmp.setPhone(iPhone);
+                            newThEmp.setIntrumId(intrumId);
+                            newThEmp.setStatus(EmployeeStatus.active);
+                            newThEmp.setSex(iSex);
+                            newThEmp.setEmail(iEmail);
+                            newThEmp.setPosition(iPos);
+                            newThEmp.setDepartment(iDep);
+                            newThEmp.setOrganization(iDep != null ? iDep.getOrganization() : null);
+                            EmployeeDepartmentPositionRelation edpr =
+                                    newThEmp.getEmployeeDepartmentPositionRelations().get(0);
+                            edpr.setDepartment(iDep);
+                            edpr.setPosition(iPos);
+                            edpr.setMain(true);
+                            dataManager.commit(newThEmp);
+                            added++;
+                        }
+                        loaded++;
+                    }
+                }
+            }
+
+            //3) Случай отсутствия сотрудника в сообщении Intrum, то есть когда сотрудник уволен
+            for (ExtEmployee employee : thesisEmps) {
+                if (EmployeeStatus.fired.equals(employee.getStatus())) {
+                    continue;
+                }
+                boolean needsSynch = false;
+                for (EmployeeDepartmentPositionRelation edpr :
+                        employee.getEmployeeDepartmentPositionRelations()) {
+                    if (edpr.getDepartment() instanceof ExtDepartment &&
+                            ((ExtDepartment) edpr.getDepartment()).getNeedsSynchronizationWithCrm() &&
+                            !employee.getDoesntNeedSynchronizationWithCrm()) {
+                        needsSynch = true;
+                        break;
+                    }
+                }
+                if (needsSynch) {
+                    employee.setStatus(EmployeeStatus.fired);
+                    fired++;
+                }
+            }
+            dataManager.commit(new CommitContext(thesisEmps));
+
+            //Теперь нужно пройти по всем группам менеджеров и обновить название группы,
+            // потому что оно должно содержать Отображаемое имя Руководителя группы продаж в этой
+            // группе:
+            LoadContext mngGroupCtx = new LoadContext(ExtDepartment.class);
+            mngGroupCtx.setView("_local").setQueryString("select dep from thesisab$Department dep " +
+                    "where lower(dep.name) like :name").setParameter("name", MANAGER_GROUP + "%");
+            for (ExtDepartment dep : dataManager.<ExtDepartment>loadList(mngGroupCtx)) {
+                String chiefName;
+                StringBuilder depName = new StringBuilder();
+                LoadContext empCtx = new LoadContext(ExtEmployee.class);
+                empCtx.setView("_local").setQueryString("select emp from thesisab$Employee emp " +
+                        "join emp.employeeDepartmentPositionRelations edpr " +
+                        "where edpr.department.id = :depId and lower(edpr.position.name) = :posName and " +
+                        "emp.status <> :exclStatus")
+                        .setParameter("depId", dep.getId())
+                        .setParameter("posName", MANAGER_GROUP_CHIEF)
+                        .setParameter("exclStatus", EmployeeStatus.fired.getId());
+                ExtEmployee chiefMng = dataManager.load(empCtx);
+                chiefName = chiefMng != null ? chiefMng.getName() : "";
+                depName.append(StringUtils.capitalize(MANAGER_GROUP));
+                if (StringUtils.isNotEmpty(chiefName)) {
+                    depName.append(" (").append(chiefName).append(")");
+                }
+                dep.setName(depName.toString());
+                dataManager.commit(dep);
+            }
+
+            result.append("Loaded ").append(loaded).append(" employees: \n")
+                    .append("added: ").append(added).append(";\n")
+                    .append("checked: ").append(checked).append(";\n")
+                    .append("updated: ").append(updated).append(";\n")
+                    .append("reinstated: ").append(reinstated).append(";\n")
+                    .append("fired: ").append(fired).append(".");
+
+            log.debug("Finished successfully:\n" + result.toString());
+        } else {
+            String receivedNullMsg = "Error: received null response";
+            result.append(receivedNullMsg);
+            log.error(receivedNullMsg);
+        }
+
+        return result.toString();
+    }
+
+
+}
